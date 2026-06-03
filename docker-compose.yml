@@ -1,0 +1,76 @@
+# docker-compose.yml
+# Single compose file for the whole project.
+#
+# Services:
+#   postgres      — source relational DB
+#   memgraph      — target knowledge graph (MAGE image = Memgraph + algorithm modules)
+#   lab           — Memgraph Lab browser UI  →  http://localhost:3000
+#
+# Usage:
+#   docker compose up -d
+#   docker compose down -v    # tear down + wipe volumes
+
+services:
+
+  # ── Source: PostgreSQL ────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: graflo_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB:       ${POSTGRES_DATABASE:-mydb}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USERNAME:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Target: Memgraph MAGE ─────────────────────────────────────────────────
+  # memgraph-mage = Memgraph + graph algorithm modules (PageRank, community
+  # detection, centrality, path algorithms, …) — a strict superset of the
+  # plain memgraph image, recommended for knowledge graph projects.
+  #
+  # Healthcheck uses bash /dev/tcp (built-in) — nc is not in the image.
+  memgraph:
+    image: memgraph/memgraph-mage:latest
+    container_name: memgraph-mage
+    pull_policy: always
+    ports:
+      - "${MEMGRAPH_BOLT_PORT:-7687}:7687"   # Bolt — GraFlo connects here
+      - "${MEMGRAPH_HTTP_PORT:-7444}:7444"   # HTTP monitoring
+    volumes:
+      - mg_data:/var/lib/memgraph
+      - mg_log:/var/log/memgraph
+    command: ["--log-level=WARNING"]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/7687' 2>/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20        # up to 100 s total
+      start_period: 10s  # ignore failures during initial boot
+
+  # ── Memgraph Lab (browser UI) ─────────────────────────────────────────────
+  lab:
+    image: memgraph/lab:latest
+    container_name: memgraph-lab
+    pull_policy: always
+    ports:
+      - "${MEMGRAPH_LAB_PORT:-3000}:3000"
+    environment:
+      - QUICK_CONNECT_MG_HOST=memgraph
+      - QUICK_CONNECT_MG_PORT=7687
+    depends_on:
+      memgraph:
+        condition: service_healthy   # wait for bolt port to be open
+
+volumes:
+  pg_data:
+  mg_data:
+  mg_log:

@@ -1,0 +1,6 @@
+# requirements.txt
+# Python 3.11+ required
+
+graflo            # GraFlo core (includes psycopg2-binary, gdb clients, rdflib)
+python-dotenv     # optional: auto-load .env into os.environ
+pyyaml            # for saving the inferred manifest to YAML
