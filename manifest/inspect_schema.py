@@ -34,6 +34,16 @@ except ImportError:
     pass
 
 
+# ── Name normalisation ────────────────────────────────────────────────────────
+# GraFlo stores vertex/edge names as tuples e.g. ("pilothouse_admin", "apm_1")
+# rather than plain strings. to_str() extracts just the table name part.
+
+def to_str(name) -> str:
+    if isinstance(name, (tuple, list)):
+        return str(name[-1])   # last element = table name, ignore schema prefix
+    return str(name)
+
+
 def build_postgres_config() -> PostgresConfig:
     missing = [v for v in ["POSTGRES_URI", "POSTGRES_USERNAME",
                             "POSTGRES_PASSWORD", "POSTGRES_DATABASE"]
@@ -53,51 +63,49 @@ def build_postgres_config() -> PostgresConfig:
 
 
 def parse_prefixes() -> list[str]:
-    """Read TABLE_PREFIXES=apm_,evt_ from env → ['apm_', 'evt_']"""
     raw = os.getenv("TABLE_PREFIXES", "").strip()
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
-def filter_manifest(manifest, prefixes: list[str]):
-    """
-    Keep only vertices (and edges connecting them) whose table names
-    start with one of the given prefixes.
-    """
-    schema = manifest.require_schema()
+def matches(name, prefixes: list[str]) -> bool:
+    """Check if a vertex/edge name (string or tuple) starts with any prefix."""
+    n = to_str(name)
+    return any(n.startswith(p) for p in prefixes)
 
-    def matches(name: str) -> bool:
-        return any(name.startswith(p) for p in prefixes)
+
+def filter_manifest(manifest, prefixes: list[str]):
+    schema = manifest.require_schema()
 
     # Filter vertex types
     orig_vertices = schema.core_schema.vertex_config.vertices
-    kept_vertices = [v for v in orig_vertices if matches(v.name)]
-    kept_names    = {v.name for v in kept_vertices}
+    kept_vertices = [v for v in orig_vertices if matches(v.name, prefixes)]
+    kept_names    = {to_str(v.name) for v in kept_vertices}
 
     if not kept_vertices:
         print(f"\n[warn] No tables match prefixes {prefixes}.")
         print("       Check TABLE_PREFIXES in your .env or the schema name.")
-        return manifest   # return unfiltered so the user can see what exists
+        print("       Showing ALL tables instead so you can see what exists.\n")
+        return manifest
 
-    # Filter edge types — keep edges where both endpoints are in kept_names
-    # OR where the edge table itself matches a prefix
-    orig_edges  = schema.core_schema.edge_config
-    kept_edges  = {
+    # Filter edges — keep if both endpoints are in kept_names,
+    # or if the edge table name itself matches a prefix
+    orig_edges = schema.core_schema.edge_config
+    kept_edges = {
         k: e for k, e in orig_edges.items()
-        if matches(k)
+        if matches(k, prefixes)
         or (
-            getattr(e, "source_vertex", None) in kept_names
-            and getattr(e, "target_vertex", None) in kept_names
+            to_str(getattr(e, "source_vertex", "")) in kept_names
+            and to_str(getattr(e, "target_vertex", "")) in kept_names
         )
     }
 
-    # Patch schema in-place (Pydantic v2 model_copy)
     new_vertex_cfg = schema.core_schema.vertex_config.model_copy(
         update={"vertices": kept_vertices}
     )
     new_core = schema.core_schema.model_copy(
         update={"vertex_config": new_vertex_cfg, "edge_config": kept_edges}
     )
-    new_schema = schema.model_copy(update={"core_schema": new_core})
+    new_schema  = schema.model_copy(update={"core_schema": new_core})
     return manifest.model_copy(update={"schema": new_schema})
 
 
@@ -105,8 +113,8 @@ def print_summary(manifest, prefixes: list[str]) -> None:
     schema          = manifest.require_schema()
     ingestion_model = manifest.require_ingestion_model()
 
-    vertices = schema.core_schema.vertex_config.vertices
-    edges    = dict(schema.core_schema.edge_config)
+    vertices  = schema.core_schema.vertex_config.vertices
+    edges     = dict(schema.core_schema.edge_config)
     resources = ingestion_model.resources
 
     W = 62
@@ -118,46 +126,55 @@ def print_summary(manifest, prefixes: list[str]) -> None:
 
     # ── Vertices ──────────────────────────────────────────────────────────
     print(f"\n  VERTEX TYPES  ({len(vertices)} tables → nodes)\n")
-    for v in sorted(vertices, key=lambda x: x.name):
+    for v in sorted(vertices, key=lambda x: to_str(x.name)):
         fields     = getattr(v, "fields", []) or []
-        identities = getattr(v, "identity_fields", []) \
-                     or getattr(v, "identities", []) or []
+        identities = (getattr(v, "identity_fields", None)
+                      or getattr(v, "identities", None) or [])
         field_names = [
-            (f if isinstance(f, str) else getattr(f, "name", str(f)))
+            to_str(f if isinstance(f, str) else getattr(f, "name", f))
             for f in fields
         ]
         id_names = [
-            (i if isinstance(i, str) else getattr(i, "name", str(i)))
+            to_str(i if isinstance(i, str) else getattr(i, "name", i))
             for i in identities
         ]
-        print(f"    ● {v.name}")
+        print(f"    ● {to_str(v.name)}")
         if id_names:
             print(f"        identity : {', '.join(id_names)}")
         if field_names:
-            print(f"        fields   : {', '.join(field_names)}")
+            # wrap long field lists
+            line, lines = [], []
+            for fn in field_names:
+                line.append(fn)
+                if len(", ".join(line)) > 50:
+                    lines.append(", ".join(line[:-1]))
+                    line = [fn]
+            lines.append(", ".join(line))
+            pad = " " * 19
+            print(f"        fields   : {lines[0]}")
+            for l in lines[1:]:
+                print(f"{pad}{l}")
 
     # ── Edges ─────────────────────────────────────────────────────────────
     print(f"\n  EDGE TYPES  ({len(edges)} tables → relationships)\n")
     if edges:
-        for name, e in sorted(edges.items()):
-            src = getattr(e, "source_vertex", "?")
-            tgt = getattr(e, "target_vertex", "?")
-            w   = getattr(e, "weight_field",  None)
-            print(f"    ─▶ {name}")
+        for name, e in sorted(edges.items(), key=lambda x: to_str(x[0])):
+            src = to_str(getattr(e, "source_vertex", "?"))
+            tgt = to_str(getattr(e, "target_vertex", "?"))
+            print(f"    ─▶ {to_str(name)}")
             print(f"        {src}  →  {tgt}")
-            if w:
-                print(f"        weight : {w}")
     else:
-        print("    (none detected — check that FK constraints exist on your tables)")
+        print("    (none — GraFlo detects edges from FK constraints;")
+        print("     if your apm_ tables have no FK constraints, this is expected)")
 
     # ── Resources ─────────────────────────────────────────────────────────
     print(f"\n  RESOURCES  ({len(resources)} ingestion pipelines)\n")
-    for r in sorted(resources, key=lambda x: x.name):
-        print(f"    ▸ {r.name}")
+    for r in sorted(resources, key=lambda x: to_str(x.name)):
+        print(f"    ▸ {to_str(r.name)}")
 
     print("\n" + "═" * W)
     print("  Manifest saved → generated-manifest.yaml")
-    print("  Review it, then run:  python ingest.py")
+    print("  When Memgraph is ready, run:  python ingest.py")
     print("═" * W + "\n")
 
 
@@ -170,15 +187,12 @@ def main() -> None:
     if prefixes:
         print(f"Filtering tables by prefix(es): {', '.join(prefixes)}")
 
-    # Inference only touches PostgreSQL — DBType here only shapes how the
-    # manifest schema types are expressed; no graph DB connection is made.
     engine   = GraphEngine(target_db_flavor=DBType.MEMGRAPH)
     manifest = engine.infer_manifest(postgres_conf, schema_name=schema_name)
 
     if prefixes:
         manifest = filter_manifest(manifest, prefixes)
 
-    # Save YAML
     out = Path("generated-manifest.yaml")
     with open(out, "w") as fh:
         yaml.safe_dump(
