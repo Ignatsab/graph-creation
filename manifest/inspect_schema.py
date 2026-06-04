@@ -95,7 +95,8 @@ def filter_manifest(manifest, prefixes: list[str]):
         return manifest
 
     # ── 1. Schema: edges (keep only if BOTH endpoints are in kept_names) ──
-    orig_edges  = schema.core_schema.edge_config
+    # Convert to plain dict immediately — EdgeConfig has .items() but no len()
+    orig_edges  = dict(schema.core_schema.edge_config)
     kept_edges  = {
         k: e for k, e in orig_edges.items()
         if matches(k, prefixes)
