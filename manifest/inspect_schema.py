@@ -195,10 +195,29 @@ def print_summary(manifest, prefixes: list[str]) -> None:
     print(f"\n  EDGE TYPES  ({len(edges)} tables → relationships)\n")
     if edges:
         for name, e in sorted(edges.items(), key=lambda x: to_str(x[0])):
-            src = to_str(getattr(e, "source_vertex", "?"))
-            tgt = to_str(getattr(e, "target_vertex", "?"))
+            # Try every plausible attribute name GraFlo might use
+            src = "?"
+            for attr in ["source_vertex", "source", "from_vertex", "from_node"]:
+                val = getattr(e, attr, None)
+                if val:
+                    src = to_str(val)
+                    break
+            tgt = "?"
+            for attr in ["target_vertex", "target", "to_vertex", "to_node"]:
+                val = getattr(e, attr, None)
+                if val:
+                    tgt = to_str(val)
+                    break
             print(f"    ─▶ {to_str(name)}")
-            print(f"        {src}  →  {tgt}")
+            if src == "?" or tgt == "?":
+                # Dump all fields so we can see the real attribute names
+                try:
+                    all_fields = e.model_dump()
+                except Exception:
+                    all_fields = vars(e) if hasattr(e, "__dict__") else str(e)
+                print(f"        [debug] raw fields: {all_fields}")
+            else:
+                print(f"        {src}  →  {tgt}")
     else:
         print("    (none — check that FK constraints exist on your tables)")
 
