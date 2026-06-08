@@ -90,15 +90,21 @@ def extract_vertices(manifest: dict) -> tuple[list, set[str]]:
     return vertices, names
 
 
-def extract_edges(manifest: dict) -> dict:
-    """Find edge_config dict anywhere in the YAML."""
+def extract_edges(manifest: dict):
+    """Find edge_config anywhere in the YAML."""
     for key in ["edge_config", "edges", "edge_configs"]:
         val, path = find_key(manifest, key)
+
         if isinstance(val, dict) and val:
-            print(f"  [manifest] edges found at: {path}  ({len(val)} items)")
+            print(f"  [manifest] edges found at: {path} ({len(val)} items)")
             return val
+
+        if isinstance(val, list) and val:
+            print(f"  [manifest] edges found at: {path} ({len(val)} items)")
+            return val
+
     print("  [manifest] no edges found in YAML")
-    return {}
+    return []
 
 
 def _find_vertex_list(manifest: dict) -> tuple:
@@ -202,13 +208,26 @@ def build_prompt(vertex_names: set[str], edges: dict,
 
     # ── 2. Known edges ───────────────────────────────────────────────────────
     lines.append(f"\nKNOWN EDGES ({len(edges)}):")
-    if edges:
-        for ename, e in edges.items():
-            src = to_str(e.get("source_vertex", e.get("source", "?")))
-            tgt = to_str(e.get("target_vertex", e.get("target", "?")))
-            lines.append(f"  {to_str(ename)}: {src} → {tgt}")
-    else:
-        lines.append("  (none)")
+
+if isinstance(edges, dict):
+    for ename, e in edges.items():
+        src = to_str(e.get("source_vertex", e.get("source", "?")))
+        tgt = to_str(e.get("target_vertex", e.get("target", "?")))
+        lines.append(f"  {to_str(ename)}: {src} → {tgt}")
+
+elif isinstance(edges, list):
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+
+        ename = to_str(e.get("name", "unnamed_edge"))
+        src = to_str(e.get("source_vertex", e.get("source", "?")))
+        tgt = to_str(e.get("target_vertex", e.get("target", "?")))
+
+        lines.append(f"  {ename}: {src} → {tgt}")
+
+else:
+    lines.append("  (none)")
 
     # ── 3. Implicit FK candidates — only for vertex tables ──────────────────
     lines.append("\nIMPLICIT FK CANDIDATES (columns that look like missing relationships):")
@@ -363,19 +382,19 @@ def resolve(name: str, exact: dict, fuzzy: dict) -> str | None:
     return None
 
 
-def find_edge_config(manifest: dict) -> dict:
-    """Find and return the edge_config dict (mutable reference)."""
-    edges = extract_edges(manifest)
-    # If we got a value, we need the mutable reference inside manifest
-    # Re-locate it by path
+def find_edge_config(manifest: dict):
     for key in ["edge_config", "edges", "edge_configs"]:
         val, path = find_key(manifest, key)
-        if isinstance(val, dict):
+
+        if isinstance(val, (dict, list)):
             return val
-    # Not found — create one at the most likely path
-    core = (manifest.setdefault("schema", {})
-                    .setdefault("core_schema", {}))
-    core.setdefault("edge_config", {})
+
+    core = (
+        manifest.setdefault("schema", {})
+                .setdefault("core_schema", {})
+    )
+
+    core.setdefault("edge_config", [])
     return core["edge_config"]
 
 
@@ -402,23 +421,43 @@ def apply_suggestions(manifest: dict, suggestions: dict) -> dict:
         src = resolve(src_raw, exact_idx, fuzzy_idx)
         tgt = resolve(tgt_raw, exact_idx, fuzzy_idx)
 
-        if ename in edge_cfg:
-            print(f"  [skip] '{ename}' already exists")
-            continue
-        if src is None or tgt is None:
-            bad = f"source='{src_raw}'" if src is None else f"target='{tgt_raw}'"
-            print(f"  [skip] '{ename}' — {bad} not found in manifest")
-            continue
+        if isinstance(edge_cfg, list):
 
-        edge_cfg[ename] = {
-            "name":          ename,
-            "source_vertex": exact_idx[src]["name"],
-            "target_vertex": exact_idx[tgt]["name"],
-            "fields":        [],
-            "_llm":          True,
-            "_via":          src_col,
-            "_why":          e.get("rationale", ""),
-        }
+    existing_names = {
+        e.get("name")
+        for e in edge_cfg
+        if isinstance(e, dict)
+    }
+
+    if ename in existing_names:
+        print(f"  [skip] '{ename}' already exists")
+        continue
+
+    edge_cfg.append({
+        "name": ename,
+        "source_vertex": exact_idx[src]["name"],
+        "target_vertex": exact_idx[tgt]["name"],
+        "fields": [],
+        "_llm": True,
+        "_via": src_col,
+        "_why": e.get("rationale", ""),
+    })
+
+elif isinstance(edge_cfg, dict):
+
+    if ename in edge_cfg:
+        print(f"  [skip] '{ename}' already exists")
+        continue
+
+    edge_cfg[ename] = {
+        "name": ename,
+        "source_vertex": exact_idx[src]["name"],
+        "target_vertex": exact_idx[tgt]["name"],
+        "fields": [],
+        "_llm": True,
+        "_via": src_col,
+        "_why": e.get("rationale", ""),
+    }
         print(f"  [add] {ename}: {src} → {tgt}  (via {src_col})")
         applied += 1
 
