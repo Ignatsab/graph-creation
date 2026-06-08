@@ -190,18 +190,17 @@ def fetch_column_metadata() -> dict[str, list[dict]]:
 # Build compact LLM prompt — optimised for smaller context windows
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_prompt(vertex_names: set[str], edges: dict,
+def build_prompt(vertex_names: set[str], edges,
                  col_meta: dict[str, list[dict]]) -> str:
     """
     Deliberately compact — three sections only:
       1. Exact vertex names the LLM must use
       2. Already-known edges
       3. Implicit FK candidates (columns ending _id/_fk with no constraint)
-    No full column dumps — keeps the prompt small for limited-context models.
     """
     lines = []
 
-    # ── 1. Vertex names — the LLM must copy these exactly ───────────────────
+    # ── 1. Vertex names ──────────────────────────────────────────────────────
     lines.append("VERTICES (use these exact names in your JSON):")
     for n in sorted(vertex_names):
         lines.append(f"  {n}")
@@ -209,92 +208,131 @@ def build_prompt(vertex_names: set[str], edges: dict,
     # ── 2. Known edges ───────────────────────────────────────────────────────
     lines.append(f"\nKNOWN EDGES ({len(edges)}):")
 
-if isinstance(edges, dict):
-    for ename, e in edges.items():
-        src = to_str(e.get("source_vertex", e.get("source", "?")))
-        tgt = to_str(e.get("target_vertex", e.get("target", "?")))
-        lines.append(f"  {to_str(ename)}: {src} → {tgt}")
+    if isinstance(edges, dict):
+        for ename, edge in edges.items():
+            if not isinstance(edge, dict):
+                continue
 
-elif isinstance(edges, list):
-    for e in edges:
-        if not isinstance(e, dict):
-            continue
+            src = to_str(edge.get("source_vertex", edge.get("source", "?")))
+            tgt = to_str(edge.get("target_vertex", edge.get("target", "?")))
+            lines.append(f"  {to_str(ename)}: {src} → {tgt}")
 
-        ename = to_str(e.get("name", "unnamed_edge"))
-        src = to_str(e.get("source_vertex", e.get("source", "?")))
-        tgt = to_str(e.get("target_vertex", e.get("target", "?")))
+    elif isinstance(edges, list):
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
 
-        lines.append(f"  {ename}: {src} → {tgt}")
+            ename = to_str(edge.get("name", "unnamed_edge"))
+            src = to_str(edge.get("source_vertex", edge.get("source", "?")))
+            tgt = to_str(edge.get("target_vertex", edge.get("target", "?")))
 
-else:
-    lines.append("  (none)")
+            lines.append(f"  {ename}: {src} → {tgt}")
 
-    # ── 3. Implicit FK candidates — only for vertex tables ──────────────────
+    else:
+        lines.append("  (none)")
+
+    # ── 3. Implicit FK candidates ───────────────────────────────────────────
     lines.append("\nIMPLICIT FK CANDIDATES (columns that look like missing relationships):")
+
     found_any = False
-    for table in sorted(vertex_names):           # only manifest tables
+
+    for table in sorted(vertex_names):
         cols = col_meta.get(table, [])
+
         candidates = [
             c for c in cols
-            if not c["pk"] and not c["fk_to"]
-            and (c["column"].endswith("_id") or c["column"].endswith("_fk")
-                 or c["column"].endswith("_ref"))
+            if not c["pk"]
+            and not c["fk_to"]
+            and (
+                c["column"].endswith("_id")
+                or c["column"].endswith("_fk")
+                or c["column"].endswith("_ref")
+            )
         ]
+
         if candidates:
             found_any = True
+
             for c in candidates:
-                guess = (c["column"]
-                         .removesuffix("_id")
-                         .removesuffix("_fk")
-                         .removesuffix("_ref"))
-                in_manifest = guess in vertex_names
-                lines.append(
-                    f"  {table}.{c['column']} ({c['type']})"
-                    f"  →  probably references '{guess}'"
-                    f"  {'[IN MANIFEST]' if in_manifest else '[NOT IN MANIFEST]'}"
+                guess = (
+                    c["column"]
+                    .removesuffix("_id")
+                    .removesuffix("_fk")
+                    .removesuffix("_ref")
                 )
 
-    # also check non-manifest tables that reference manifest tables
+                in_manifest = guess in vertex_names
+
+                lines.append(
+                    f"  {table}.{c['column']} ({c['type']})"
+                    f" → probably references '{guess}' "
+                    f"{'[IN MANIFEST]' if in_manifest else '[NOT IN MANIFEST]'}"
+                )
+
     lines.append("\nNON-MANIFEST TABLES REFERENCING MANIFEST TABLES:")
+
     found_external = False
+
     for table, cols in sorted(col_meta.items()):
         if table in vertex_names:
             continue
+
         refs = [
             c for c in cols
-            if not c["pk"] and not c["fk_to"]
-            and (c["column"].endswith("_id") or c["column"].endswith("_fk"))
-            and c["column"].removesuffix("_id").removesuffix("_fk") in vertex_names
+            if not c["pk"]
+            and not c["fk_to"]
+            and (
+                c["column"].endswith("_id")
+                or c["column"].endswith("_fk")
+            )
+            and c["column"].removesuffix("_id").removesuffix("_fk")
+            in vertex_names
         ]
+
         if refs:
             found_external = True
+
             for c in refs:
-                lines.append(f"  {table}.{c['column']} → manifest table '{c['column'].removesuffix('_id').removesuffix('_fk')}'")
+                lines.append(
+                    f"  {table}.{c['column']} → manifest table "
+                    f"'{c['column'].removesuffix('_id').removesuffix('_fk')}'"
+                )
 
     if not found_any:
         lines.append("  (none found — tables may lack _id naming conventions)")
+
     if not found_external:
         lines.append("  (none)")
 
-    # ── Type anomalies — only flag obvious mismatches ────────────────────────
     lines.append("\nPOSSIBLE TYPE MISMATCHES (in manifest vertex tables):")
+
     type_issues = []
+
     for table in sorted(vertex_names):
         for c in col_meta.get(table, []):
             pg_type = c["type"].lower()
+
             if any(t in pg_type for t in ["timestamp", "date", "time"]):
-                type_issues.append(f"  {table}.{c['column']} is {c['type']} — should be DATETIME not STRING")
+                type_issues.append(
+                    f"  {table}.{c['column']} is {c['type']} "
+                    f"— should be DATETIME not STRING"
+                )
             elif "bool" in pg_type:
-                type_issues.append(f"  {table}.{c['column']} is BOOLEAN — should be BOOL")
+                type_issues.append(
+                    f"  {table}.{c['column']} is BOOLEAN — should be BOOL"
+                )
             elif any(t in pg_type for t in ["numeric", "decimal", "real", "double"]):
-                type_issues.append(f"  {table}.{c['column']} is {c['type']} — should be FLOAT")
+                type_issues.append(
+                    f"  {table}.{c['column']} is {c['type']} "
+                    f"— should be FLOAT"
+                )
+
     if type_issues:
-        lines.extend(type_issues[:20])   # cap at 20 to save context
+        lines.extend(type_issues[:20])
     else:
         lines.append("  (none detected)")
 
     return "\n".join(lines)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM call
@@ -400,6 +438,7 @@ def find_edge_config(manifest: dict):
 
 def apply_suggestions(manifest: dict, suggestions: dict) -> dict:
     import copy
+
     m = copy.deepcopy(manifest)
 
     exact_idx, fuzzy_idx = build_vtx_index(m)
@@ -412,65 +451,84 @@ def apply_suggestions(manifest: dict, suggestions: dict) -> dict:
 
     applied = 0
 
-    for e in suggestions.get("suggested_edges", []):
-        ename   = e.get("name", "")
-        src_raw = e.get("source_table", "")
-        tgt_raw = e.get("target_table", "")
-        src_col = e.get("source_column", "")
+    for suggestion in suggestions.get("suggested_edges", []):
+
+        if not isinstance(suggestion, dict):
+            continue
+
+        ename = suggestion.get("name", "")
+        src_raw = suggestion.get("source_table", "")
+        tgt_raw = suggestion.get("target_table", "")
+        src_col = suggestion.get("source_column", "")
 
         src = resolve(src_raw, exact_idx, fuzzy_idx)
         tgt = resolve(tgt_raw, exact_idx, fuzzy_idx)
 
+        if src is None or tgt is None:
+            print(
+                f"  [skip] '{ename}' "
+                f"(source='{src_raw}', target='{tgt_raw}')"
+            )
+            continue
+
         if isinstance(edge_cfg, list):
 
-    existing_names = {
-        e.get("name")
-        for e in edge_cfg
-        if isinstance(e, dict)
-    }
+            existing_names = {
+                edge.get("name")
+                for edge in edge_cfg
+                if isinstance(edge, dict)
+            }
 
-    if ename in existing_names:
-        print(f"  [skip] '{ename}' already exists")
-        continue
+            if ename in existing_names:
+                print(f"  [skip] '{ename}' already exists")
+                continue
 
-    edge_cfg.append({
-        "name": ename,
-        "source_vertex": exact_idx[src]["name"],
-        "target_vertex": exact_idx[tgt]["name"],
-        "fields": [],
-        "_llm": True,
-        "_via": src_col,
-        "_why": e.get("rationale", ""),
-    })
+            edge_cfg.append({
+                "name": ename,
+                "source_vertex": exact_idx[src]["name"],
+                "target_vertex": exact_idx[tgt]["name"],
+                "fields": [],
+                "_llm": True,
+                "_via": src_col,
+                "_why": suggestion.get("rationale", ""),
+            })
 
-elif isinstance(edge_cfg, dict):
+        elif isinstance(edge_cfg, dict):
 
-    if ename in edge_cfg:
-        print(f"  [skip] '{ename}' already exists")
-        continue
+            if ename in edge_cfg:
+                print(f"  [skip] '{ename}' already exists")
+                continue
 
-    edge_cfg[ename] = {
-        "name": ename,
-        "source_vertex": exact_idx[src]["name"],
-        "target_vertex": exact_idx[tgt]["name"],
-        "fields": [],
-        "_llm": True,
-        "_via": src_col,
-        "_why": e.get("rationale", ""),
-    }
-        print(f"  [add] {ename}: {src} → {tgt}  (via {src_col})")
+            edge_cfg[ename] = {
+                "name": ename,
+                "source_vertex": exact_idx[src]["name"],
+                "target_vertex": exact_idx[tgt]["name"],
+                "fields": [],
+                "_llm": True,
+                "_via": src_col,
+                "_why": suggestion.get("rationale", ""),
+            }
+
+        print(f"  [add] {ename}: {src} → {tgt} (via {src_col})")
         applied += 1
 
     for corr in suggestions.get("field_type_corrections", []):
-        tbl   = resolve(corr.get("table", ""), exact_idx, fuzzy_idx)
-        col   = corr.get("column", "")
+
+        tbl = resolve(corr.get("table", ""), exact_idx, fuzzy_idx)
+        col = corr.get("column", "")
         ntype = corr.get("suggested_type", "")
+
         if not tbl:
             continue
+
         for field in exact_idx[tbl].get("fields", []):
-            if isinstance(field, dict) and to_str(field.get("name", "")) == col:
+            if (
+                isinstance(field, dict)
+                and to_str(field.get("name", "")) == col
+            ):
                 old = field.get("field_type", "?")
                 field["field_type"] = ntype
+
                 print(f"  [type] {tbl}.{col}: {old} → {ntype}")
                 applied += 1
                 break
